@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
 import torch
 from tensordict import TensorDict
+from torch.utils.tensorboard import SummaryWriter
 
 from mjlab.tasks.soccer_reactive.models.history_encoder_actor_critic import (
   ReactiveSoccerActorCritic,
@@ -44,7 +46,15 @@ class ReactiveSoccerRunner:
     self.device = device
     self.log_dir = log_dir
     self.current_learning_iteration = 0
+    self.rank = int(os.environ.get('RANK', '0'))
     self.logger = SimpleNamespace(save_model=lambda *args, **kwargs: None)
+    self.tb_log_dir = Path(log_dir) / 'tensorboard' if log_dir is not None else None
+    use_tensorboard = (
+      self.tb_log_dir is not None
+      and train_cfg.get('logger', 'tensorboard') == 'tensorboard'
+      and self.rank == 0
+    )
+    self.tb_writer = SummaryWriter(log_dir=str(self.tb_log_dir)) if use_tensorboard else None
 
     actor_current_dim = self._flat_dim(env.unwrapped.observation_manager.group_obs_dim['actor_current'])
     actor_history_dim = env.unwrapped.observation_manager.group_obs_dim['actor_history'][-1]
@@ -131,6 +141,21 @@ class ReactiveSoccerRunner:
 
   def add_git_repo_to_log(self, *_args: Any, **_kwargs: Any) -> None:
     return None
+
+  def _write_tensorboard_scalars(self, iteration: int, log_dict: dict[str, float]) -> None:
+    if self.tb_writer is None:
+      return
+    for key in (
+      'surrogate',
+      'goal_value',
+      'aux_value',
+      'reconstruction',
+      'symmetry',
+      'amp_discriminator',
+      'amp_reward',
+    ):
+      if key in log_dict:
+        self.tb_writer.add_scalar(f'train/{key}', float(log_dict[key]), iteration)
 
   def save(self, path: str, infos=None) -> None:
     state = {
@@ -226,6 +251,14 @@ class ReactiveSoccerRunner:
       )
       self.current_learning_iteration += 1
       save_interval = int(self.cfg.get('save_interval', 0) or 0)
-      if self.log_dir is not None and save_interval > 0:
-        if self.current_learning_iteration % save_interval == 0:
+      if self.log_dir is not None:
+        self._write_tensorboard_scalars(
+          self.current_learning_iteration, self._latest_logs
+        )
+        if save_interval > 0 and self.current_learning_iteration % save_interval == 0:
           self.save(str(Path(self.log_dir) / f'model_{self.current_learning_iteration}.pt'))
+
+  def close(self) -> None:
+    if self.tb_writer is not None:
+      self.tb_writer.flush()
+      self.tb_writer.close()

@@ -17,6 +17,7 @@ def g1_comp_reactive_soccer_runner_cfg() -> RslRlOnPolicyRunnerCfg:
   """Create the minimal runner configuration for the reactive soccer task."""
   cfg = RslRlOnPolicyRunnerCfg(
     class_name=REACTIVE_RUNNER_CLASS,
+    logger="tensorboard",
     actor=RslRlModelCfg(
       class_name=REACTIVE_MODEL_CLASS,
       hidden_dims=(512, 256, 128),
