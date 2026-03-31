@@ -30,7 +30,7 @@ class MLP(nn.Module):
 
 
 class ReactiveSoccerActorCritic(nn.Module):
-  """Minimal unified model with history encoder, decoder, actor and dual critics."""
+  """Unified model with paper-style history encoder, decoder, actor and dual critics."""
 
   def __init__(
     self,
@@ -39,8 +39,10 @@ class ReactiveSoccerActorCritic(nn.Module):
     history_steps: int,
     action_dim: int,
     latent_dim: int = 64,
-    reconstruct_dim: int = 18,
+    reconstruct_dim: int = 14,
     privileged_dim: int | None = None,
+    actor_hidden_dims: tuple[int, ...] = (256, 256, 128),
+    critic_hidden_dims: tuple[int, ...] = (256, 256, 128),
   ) -> None:
     super().__init__()
     self.actor_obs_dim = actor_obs_dim
@@ -59,7 +61,7 @@ class ReactiveSoccerActorCritic(nn.Module):
     self.actor_head = MLP(
       actor_obs_dim + latent_dim,
       action_dim,
-      hidden_dims=(512, 256, 128),
+      hidden_dims=actor_hidden_dims,
     )
     self.decoder_head = MLP(
       latent_dim,
@@ -70,12 +72,12 @@ class ReactiveSoccerActorCritic(nn.Module):
     self.goal_critic_head = MLP(
       critic_input_dim,
       1,
-      hidden_dims=(256, 256, 128),
+      hidden_dims=critic_hidden_dims,
     )
     self.aux_critic_head = MLP(
       critic_input_dim,
       1,
-      hidden_dims=(256, 256, 128),
+      hidden_dims=critic_hidden_dims,
     )
 
   def encode_history(self, actor_history: torch.Tensor) -> torch.Tensor:
@@ -86,11 +88,12 @@ class ReactiveSoccerActorCritic(nn.Module):
   def forward_train(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     actor_current = batch["actor_current"]
     actor_history = batch["actor_history"]
+    critic_current = batch.get("critic_current", actor_current)
     critic_privileged = batch["critic_privileged"]
 
     latent = self.encode_history(actor_history)
     actor_input = torch.cat((actor_current, latent), dim=-1)
-    critic_input = torch.cat((actor_current, latent, critic_privileged), dim=-1)
+    critic_input = torch.cat((critic_current, latent, critic_privileged), dim=-1)
 
     return {
       "actions_mean": self.actor_head(actor_input),

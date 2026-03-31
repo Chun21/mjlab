@@ -5,8 +5,11 @@ from __future__ import annotations
 import torch
 
 from mjlab.entity import Entity
+from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.tasks.soccer.field_specs import M_FIELD
 from mjlab.utils.lab_api.math import sample_uniform
+
+from . import terminations as reactive_terminations
 
 
 def reset_ball_only(
@@ -52,3 +55,33 @@ def reset_ball_only(
   ball.write_root_link_velocity_to_sim(velocity, env_ids=env_ids)
   env.scene.write_data_to_sim()
   env.sim.forward()
+
+
+class BallContinuityResetEvent(ManagerTermBase):
+  """Reset only the ball after goal / out-of-bounds without ending the episode."""
+
+  def __init__(self, cfg, env) -> None:
+    del cfg
+    super().__init__(env)
+
+  def __call__(
+    self,
+    env,
+    env_ids: torch.Tensor | None,
+    pose_range: dict[str, tuple[float, float]] | None = None,
+  ) -> None:
+    del env_ids
+    goal_scored = reactive_terminations.goal_scored(
+      env,
+      goal_x=M_FIELD.field_length * 0.5,
+      goal_width=M_FIELD.goal_width,
+    )
+    out_of_bounds = reactive_terminations.ball_out_of_bounds(
+      env,
+      field_length=M_FIELD.field_length,
+      field_width=M_FIELD.field_width,
+    )
+    reset_env_ids = (goal_scored | out_of_bounds).nonzero(as_tuple=False).squeeze(-1)
+    if len(reset_env_ids) == 0:
+      return
+    reset_ball_only(env, reset_env_ids, pose_range=pose_range)

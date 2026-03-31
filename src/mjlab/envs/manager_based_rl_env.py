@@ -140,6 +140,18 @@ class ManagerBasedRlEnvCfg:
   algorithms that expect unscaled reward signals (e.g., HER, static reward scaling).
   """
 
+  partial_reset_term_names: tuple[str, ...] = ()
+  """Termination terms that should use a lightweight partial reset."""
+
+  partial_reset_event_name: str | None = None
+  """Event term name invoked during partial resets."""
+
+  preserve_observation_history_on_partial_reset: bool = False
+  """Keep observation history buffers across partial resets."""
+
+  preserve_action_history_on_partial_reset: bool = False
+  """Keep action history buffers across partial resets."""
+
 
 class ManagerBasedRlEnv:
   """Manager-based RL environment."""
@@ -330,6 +342,7 @@ class ManagerBasedRlEnv:
       env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
     if seed is not None:
       self.seed(seed)
+    self.extras.setdefault("log", dict())
     self._reset_idx(env_ids)
     self.scene.write_data_to_sim()
     self.sim.forward()
@@ -384,17 +397,69 @@ class ManagerBasedRlEnv:
     # NOTE: Derived quantities (xpos, xquat, ...) are stale by one physics
     # substep here. See the docstring above for why this is acceptable.
     self.reset_buf = self.termination_manager.compute()
-    self.reset_terminated = self.termination_manager.terminated
-    self.reset_time_outs = self.termination_manager.time_outs
+    self.raw_reset_buf = self.reset_buf.clone()
+    self.raw_reset_terminated = self.termination_manager.terminated.clone()
+    self.raw_reset_time_outs = self.termination_manager.time_outs.clone()
+    self.raw_termination_terms = {
+      term_name: self.termination_manager.get_term(term_name).clone()
+      for term_name in self.termination_manager.active_terms
+    }
+    self.reset_terminated = self.raw_reset_terminated.clone()
+    self.reset_time_outs = self.raw_reset_time_outs.clone()
 
     self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
     self.metrics_manager.compute()
 
     # Reset envs that terminated/timed-out and log the episode info.
     reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+    partial_reset_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
+    full_reset_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
     if len(reset_env_ids) > 0:
-      self._reset_idx(reset_env_ids)
+      self.extras["log"] = dict()
+      partial_reset_env_ids, full_reset_env_ids = self._split_reset_env_ids(reset_env_ids)
+      if len(partial_reset_env_ids) > 0:
+        self.reset_buf[partial_reset_env_ids] = False
+        self.reset_terminated[partial_reset_env_ids] = False
+        self.reset_time_outs[partial_reset_env_ids] = False
+      if len(full_reset_env_ids) > 0:
+        self._reset_idx(full_reset_env_ids)
+      if len(partial_reset_env_ids) > 0:
+        self._partial_reset_idx(partial_reset_env_ids)
       self.scene.write_data_to_sim()
+
+    empty_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
+    self.extras["soccer_reactive_events"] = {
+      "goal_scored_env_ids": self.raw_termination_terms.get(
+        "goal_scored",
+        torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+      )
+      .nonzero(as_tuple=False)
+      .squeeze(-1),
+      "ball_out_of_bounds_env_ids": self.raw_termination_terms.get(
+        "ball_out_of_bounds",
+        torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+      )
+      .nonzero(as_tuple=False)
+      .squeeze(-1),
+      "robot_fallen_env_ids": self.raw_termination_terms.get(
+        "robot_fallen",
+        torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+      )
+      .nonzero(as_tuple=False)
+      .squeeze(-1),
+      "time_out_env_ids": self.raw_termination_terms.get(
+        "time_out",
+        torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+      )
+      .nonzero(as_tuple=False)
+      .squeeze(-1),
+      "partial_reset_env_ids": partial_reset_env_ids
+      if len(partial_reset_env_ids) > 0
+      else empty_env_ids,
+      "full_reset_env_ids": full_reset_env_ids
+      if len(full_reset_env_ids) > 0
+      else empty_env_ids,
+    }
 
     # Single forward() call: recompute derived quantities from current
     # qpos/qvel for every env. For non-reset envs this resolves the
@@ -527,3 +592,55 @@ class ManagerBasedRlEnv:
     self.extras["log"].update(info)
     # reset the episode length buffer.
     self.episode_length_buf[env_ids] = 0
+
+  def _split_reset_env_ids(
+    self,
+    reset_env_ids: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    partial_terms = tuple(self.cfg.partial_reset_term_names)
+    if not partial_terms or self.cfg.partial_reset_event_name is None:
+      empty = torch.empty(0, device=self.device, dtype=torch.long)
+      return empty, reset_env_ids
+
+    partial_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    other_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    for term_name in self.termination_manager.active_terms:
+      term_value = self.termination_manager.get_term(term_name)
+      if term_name in partial_terms:
+        partial_mask |= term_value
+      else:
+        other_mask |= term_value
+    partial_only_mask = partial_mask & ~other_mask
+    selected_partial_mask = partial_only_mask[reset_env_ids]
+    partial_env_ids = reset_env_ids[selected_partial_mask]
+    full_env_ids = reset_env_ids[~selected_partial_mask]
+    return partial_env_ids, full_env_ids
+
+  def _partial_reset_idx(self, env_ids: torch.Tensor) -> None:
+    if len(env_ids) == 0:
+      return
+    self.curriculum_manager.compute(env_ids=env_ids)
+    assert self.cfg.partial_reset_event_name is not None
+    event_cfg = self.event_manager.get_term_cfg(self.cfg.partial_reset_event_name)
+    event_cfg.func(self, env_ids, **event_cfg.params)
+
+    self.extras.setdefault("log", dict())
+    if not self.cfg.preserve_observation_history_on_partial_reset:
+      info = self.observation_manager.reset(env_ids)
+      self.extras["log"].update(info)
+    if not self.cfg.preserve_action_history_on_partial_reset:
+      info = self.action_manager.reset(env_ids)
+      self.extras["log"].update(info)
+
+    info = self.reward_manager.reset(env_ids)
+    self.extras["log"].update(info)
+    info = self.metrics_manager.reset(env_ids)
+    self.extras["log"].update(info)
+    info = self.curriculum_manager.reset(env_ids)
+    self.extras["log"].update(info)
+    info = self.command_manager.reset(env_ids)
+    self.extras["log"].update(info)
+    info = self.event_manager.reset(env_ids)
+    self.extras["log"].update(info)
+    info = self.termination_manager.reset(env_ids)
+    self.extras["log"].update(info)

@@ -3,9 +3,11 @@
 import logging
 import os
 import sys
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, cast
 
 import tyro
@@ -41,6 +43,28 @@ class TrainConfig:
     env_cfg = load_env_cfg(task_id)
     agent_cfg = load_rl_cfg(task_id)
     return TrainConfig(env=env_cfg, agent=agent_cfg)
+
+
+def _cfg_to_dict(value):
+  """Convert configs to serializable dicts while preserving dynamic attributes."""
+  if is_dataclass(value):
+    data = {
+      field_info.name: _cfg_to_dict(getattr(value, field_info.name))
+      for field_info in fields(value)
+    }
+    declared_field_names = {field_info.name for field_info in fields(value)}
+    for key, nested_value in vars(value).items():
+      if key.startswith("_") or key in declared_field_names:
+        continue
+      data[key] = _cfg_to_dict(nested_value)
+    return data
+  if isinstance(value, SimpleNamespace):
+    return {key: _cfg_to_dict(nested_value) for key, nested_value in vars(value).items()}
+  if isinstance(value, dict):
+    return {key: _cfg_to_dict(nested_value) for key, nested_value in value.items()}
+  if isinstance(value, (list, tuple)):
+    return [_cfg_to_dict(item) for item in value]
+  return deepcopy(value)
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
@@ -144,8 +168,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   env = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
 
-  agent_cfg = asdict(cfg.agent)
-  env_cfg = asdict(cfg.env)
+  agent_cfg = _cfg_to_dict(cfg.agent)
+  env_cfg = _cfg_to_dict(cfg.env)
 
   runner_cls = load_runner_cls(task_id)
   if runner_cls is None:

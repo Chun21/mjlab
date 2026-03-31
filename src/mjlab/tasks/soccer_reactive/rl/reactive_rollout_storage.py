@@ -15,6 +15,7 @@ class ReactiveRolloutStorage:
     actor_obs_shape: tuple[int, ...],
     action_shape: tuple[int, ...],
     device: str,
+    critic_obs_shape: tuple[int, ...] | None = None,
     reconstruction_shape: tuple[int, ...] = (18,),
     actor_history_shape: tuple[int, ...] | None = None,
     privileged_shape: tuple[int, ...] | None = None,
@@ -22,6 +23,7 @@ class ReactiveRolloutStorage:
     self.num_envs = num_envs
     self.num_steps = num_steps
     self.actor_obs_shape = actor_obs_shape
+    self.critic_obs_shape = actor_obs_shape if critic_obs_shape is None else critic_obs_shape
     self.action_shape = action_shape
     self.device = device
     self.actor_history_shape = actor_history_shape
@@ -38,8 +40,12 @@ class ReactiveRolloutStorage:
     self.aux_rewards = torch.zeros((num_steps, num_envs, 1), device=device)
     self.dones = torch.zeros((num_steps, num_envs, 1), device=device)
     self.actions = torch.zeros((num_steps, num_envs, *action_shape), device=device)
+    self.old_action_mean = torch.zeros((num_steps, num_envs, *action_shape), device=device)
     self.old_log_probs = torch.zeros((num_steps, num_envs, 1), device=device)
     self.actor_current = torch.zeros((num_steps, num_envs, *actor_obs_shape), device=device)
+    self.critic_current = torch.zeros(
+      (num_steps, num_envs, *self.critic_obs_shape), device=device
+    )
     self.reconstruction_targets = torch.zeros(
       (num_steps, num_envs, *reconstruction_shape),
       device=device,
@@ -66,9 +72,11 @@ class ReactiveRolloutStorage:
     self,
     *,
     actor_current: torch.Tensor,
+    critic_current: torch.Tensor | None,
     actor_history: torch.Tensor | None,
     critic_privileged: torch.Tensor | None,
     actions: torch.Tensor,
+    old_action_mean: torch.Tensor,
     old_log_probs: torch.Tensor,
     goal_values: torch.Tensor,
     aux_values: torch.Tensor,
@@ -82,11 +90,15 @@ class ReactiveRolloutStorage:
 
     idx = self.step
     self.actor_current[idx].copy_(actor_current)
+    if critic_current is None:
+      critic_current = actor_current
+    self.critic_current[idx].copy_(critic_current)
     if self.actor_history is not None and actor_history is not None:
       self.actor_history[idx].copy_(actor_history)
     if self.critic_privileged is not None and critic_privileged is not None:
       self.critic_privileged[idx].copy_(critic_privileged)
     self.actions[idx].copy_(actions)
+    self.old_action_mean[idx].copy_(old_action_mean)
     self.old_log_probs[idx].copy_(old_log_probs)
     self.goal_values[idx].copy_(goal_values)
     self.aux_values[idx].copy_(aux_values)
@@ -124,7 +136,9 @@ class ReactiveRolloutStorage:
     steps = self.step
     batch: dict[str, torch.Tensor] = {
       "actor_current": self.actor_current[:steps].reshape(-1, *self.actor_obs_shape),
+      "critic_current": self.critic_current[:steps].reshape(-1, *self.critic_obs_shape),
       "actions": self.actions[:steps].reshape(-1, *self.action_shape),
+      "old_action_mean": self.old_action_mean[:steps].reshape(-1, *self.action_shape),
       "old_log_probs": self.old_log_probs[:steps].reshape(-1, 1),
       "goal_values": self.goal_values[:steps].reshape(-1, 1),
       "aux_values": self.aux_values[:steps].reshape(-1, 1),
@@ -145,4 +159,3 @@ class ReactiveRolloutStorage:
         -1, *self.critic_privileged.shape[2:]
       )
     return batch
-

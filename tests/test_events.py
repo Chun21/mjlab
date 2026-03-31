@@ -679,6 +679,29 @@ def test_apply_body_impulse_reset_clears(device):
   assert env_ids_arg[0].item() == 0
 
 
+def test_apply_body_impulse_probability_failure_resamples_cooldown(device):
+  env, mock_entity, asset_cfg, impulse = _make_impulse_env(
+    device, num_envs=2, num_bodies=1, body_ids=[0]
+  )
+
+  impulse(
+    env,
+    None,
+    force_range=(10.0, 10.0),
+    torque_range=(0.0, 0.0),
+    duration_s=(1.0, 1.0),
+    cooldown_s=(2.0, 2.0),
+    asset_cfg=asset_cfg,
+    probability=0.0,
+  )
+
+  assert not impulse._active.any()
+  torch.testing.assert_close(
+    impulse._interval_time_left,
+    torch.full((2,), 2.0, device=device),
+  )
+
+
 # ===========================================================================
 # Section 5: Recomputation integration
 # ===========================================================================

@@ -1,4 +1,4 @@
-"""Minimal AMP discriminator for reactive soccer."""
+"""AMP discriminator and losses for reactive soccer."""
 
 from __future__ import annotations
 
@@ -7,9 +7,13 @@ from torch import nn
 
 
 class AmpDiscriminator(nn.Module):
-  """Small MLP discriminator that scores expert/policy transitions."""
+  """MLP discriminator for expert vs policy motion transitions."""
 
-  def __init__(self, input_dim: int, hidden_dims: tuple[int, ...] = (128, 64)) -> None:
+  def __init__(
+    self,
+    input_dim: int,
+    hidden_dims: tuple[int, ...] = (256, 256, 128),
+  ) -> None:
     super().__init__()
     dims = (input_dim, *hidden_dims, 1)
     layers: list[nn.Module] = []
@@ -23,14 +27,25 @@ class AmpDiscriminator(nn.Module):
     return self.network(transitions)
 
   @staticmethod
+  def adversarial_reward(scores: torch.Tensor) -> torch.Tensor:
+    return -torch.tanh(0.4 * scores)
+
+  @staticmethod
   def bounded_reward(scores: torch.Tensor) -> torch.Tensor:
-    return torch.sigmoid(scores)
+    return AmpDiscriminator.adversarial_reward(scores)
+
+  @staticmethod
+  def wasserstein_loss_from_scores(
+    expert_scores: torch.Tensor,
+    policy_scores: torch.Tensor,
+  ) -> torch.Tensor:
+    return -torch.tanh(0.4 * expert_scores).mean() + torch.tanh(0.4 * policy_scores).mean()
 
   def gradient_penalty(
     self,
     expert: torch.Tensor,
     policy: torch.Tensor,
-    lambda_: float = 10.0,
+    lambda_: float = 50.0,
   ) -> torch.Tensor:
     batch = min(expert.shape[0], policy.shape[0])
     if batch == 0:
@@ -48,3 +63,26 @@ class AmpDiscriminator(nn.Module):
     )[0]
     penalty = (grad.norm(2, dim=1) - 1.0).pow(2).mean()
     return lambda_ * penalty
+
+  def discriminator_loss(
+    self,
+    expert: torch.Tensor,
+    policy: torch.Tensor,
+    gradient_penalty_coef: float = 50.0,
+  ) -> dict[str, torch.Tensor]:
+    expert_scores = self(expert)
+    policy_scores = self(policy)
+    wasserstein_loss = self.wasserstein_loss_from_scores(expert_scores, policy_scores)
+    gradient_penalty = self.gradient_penalty(
+      expert,
+      policy,
+      lambda_=gradient_penalty_coef,
+    )
+    total_loss = wasserstein_loss + gradient_penalty
+    return {
+      "expert_scores": expert_scores,
+      "policy_scores": policy_scores,
+      "wasserstein_loss": wasserstein_loss,
+      "gradient_penalty": gradient_penalty,
+      "total_loss": total_loss,
+    }

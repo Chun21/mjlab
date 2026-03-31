@@ -436,6 +436,7 @@ class apply_body_impulse:
     cooldown_s: tuple[float, float],
     asset_cfg: SceneEntityCfg,
     body_point_offset: tuple[float, float, float] | None = None,
+    probability: float = 1.0,
   ) -> None:
     """Tick impulse state: expire old impulses, trigger new ones.
 
@@ -483,6 +484,18 @@ class apply_body_impulse:
       return
 
     trigger_ids = eligible.nonzero(as_tuple=False).squeeze(-1)
+    if probability < 1.0:
+      trigger_mask = torch.rand(len(trigger_ids), device=self._device) < probability
+      rejected_ids = trigger_ids[~trigger_mask]
+      if len(rejected_ids) > 0:
+        int_low, int_high = cooldown_s
+        self._interval_time_left[rejected_ids] = (
+          torch.rand(len(rejected_ids), device=self._device) * (int_high - int_low)
+          + int_low
+        )
+      trigger_ids = trigger_ids[trigger_mask]
+      if len(trigger_ids) == 0:
+        return
     n = len(trigger_ids)
 
     # Sample forces and torques.
