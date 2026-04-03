@@ -9,6 +9,8 @@ from torch import nn
 class AmpDiscriminator(nn.Module):
   """MLP discriminator for expert vs policy motion transitions."""
 
+  _SCORE_LIMIT = 20.0
+
   def __init__(
     self,
     input_dim: int,
@@ -28,7 +30,13 @@ class AmpDiscriminator(nn.Module):
 
   @staticmethod
   def adversarial_reward(scores: torch.Tensor) -> torch.Tensor:
-    return -torch.tanh(0.4 * scores)
+    safe_scores = torch.nan_to_num(
+      scores,
+      nan=0.0,
+      posinf=AmpDiscriminator._SCORE_LIMIT,
+      neginf=-AmpDiscriminator._SCORE_LIMIT,
+    )
+    return 0.5 * (torch.tanh(0.4 * safe_scores) + 1.0)
 
   @staticmethod
   def bounded_reward(scores: torch.Tensor) -> torch.Tensor:
@@ -61,6 +69,7 @@ class AmpDiscriminator(nn.Module):
       retain_graph=True,
       only_inputs=True,
     )[0]
+    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
     penalty = (grad.norm(2, dim=1) - 1.0).pow(2).mean()
     return lambda_ * penalty
 
@@ -70,15 +79,30 @@ class AmpDiscriminator(nn.Module):
     policy: torch.Tensor,
     gradient_penalty_coef: float = 50.0,
   ) -> dict[str, torch.Tensor]:
-    expert_scores = self(expert)
-    policy_scores = self(policy)
+    expert_scores = torch.nan_to_num(
+      self(expert),
+      nan=0.0,
+      posinf=self._SCORE_LIMIT,
+      neginf=-self._SCORE_LIMIT,
+    )
+    policy_scores = torch.nan_to_num(
+      self(policy),
+      nan=0.0,
+      posinf=self._SCORE_LIMIT,
+      neginf=-self._SCORE_LIMIT,
+    )
     wasserstein_loss = self.wasserstein_loss_from_scores(expert_scores, policy_scores)
     gradient_penalty = self.gradient_penalty(
       expert,
       policy,
       lambda_=gradient_penalty_coef,
     )
-    total_loss = wasserstein_loss + gradient_penalty
+    total_loss = torch.nan_to_num(
+      wasserstein_loss + gradient_penalty,
+      nan=0.0,
+      posinf=gradient_penalty_coef,
+      neginf=-gradient_penalty_coef,
+    )
     return {
       "expert_scores": expert_scores,
       "policy_scores": policy_scores,

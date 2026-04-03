@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
+import torch
+import torch.distributed as dist
 import tyro
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -21,6 +23,39 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wandb import add_wandb_tags
 from mjlab.utils.wrappers import VideoRecorder
+
+_REACTIVE_SOCCER_TASK_ID = "Mjlab-Soccer-G1-Comp-ReactivePaper"
+
+
+def _maybe_init_reactive_soccer_distributed(
+  task_id: str,
+  device: str,
+  *,
+  rank: int,
+) -> bool:
+  if task_id != _REACTIVE_SOCCER_TASK_ID:
+    return False
+  world_size = int(os.environ.get("WORLD_SIZE", "1"))
+  if world_size <= 1 or not dist.is_available() or dist.is_initialized():
+    return False
+  backend = "nccl" if str(device).startswith("cuda") else "gloo"
+  dist.init_process_group(backend=backend, init_method="env://")
+  if rank == 0:
+    print(
+      f"[INFO] Initialized distributed reactive soccer training "
+      f"(backend={backend}, world_size={world_size})"
+    )
+  return True
+
+
+def _maybe_shutdown_distributed(initialized_by_this_process: bool) -> None:
+  if (
+    not initialized_by_this_process
+    or not dist.is_available()
+    or not dist.is_initialized()
+  ):
+    return
+  dist.destroy_process_group()
 
 
 @dataclass(frozen=True)
@@ -67,8 +102,96 @@ def _cfg_to_dict(value):
   return deepcopy(value)
 
 
+def _restore_missing_dynamic_attrs(target, template) -> None:
+  if isinstance(target, dict) and isinstance(template, dict):
+    for attr_name, attr_value in template.items():
+      if attr_name not in target:
+        target[attr_name] = deepcopy(attr_value)
+      elif isinstance(target[attr_name], (dict, SimpleNamespace)) and isinstance(
+        attr_value, (dict, SimpleNamespace)
+      ):
+        _restore_missing_dynamic_attrs(target[attr_name], attr_value)
+    return
+
+  if not hasattr(target, "__dict__") or not hasattr(template, "__dict__"):
+    return
+
+  target_vars = vars(target)
+  for attr_name, attr_value in vars(template).items():
+    if attr_name not in target_vars:
+      setattr(target, attr_name, deepcopy(attr_value))
+      continue
+    if isinstance(target_vars[attr_name], (dict, SimpleNamespace)) and isinstance(
+      attr_value, (dict, SimpleNamespace)
+    ):
+      _restore_missing_dynamic_attrs(target_vars[attr_name], attr_value)
+
+
+def _restore_task_dynamic_train_cfg_extensions(
+  task_id: str,
+  cfg: TrainConfig,
+) -> TrainConfig:
+  template_cfg = TrainConfig.from_task(task_id)
+  _restore_missing_dynamic_attrs(cfg.env, template_cfg.env)
+  _restore_missing_dynamic_attrs(cfg.agent, template_cfg.agent)
+  return cfg
+
+
+def _apply_task_specific_train_env_bindings(
+  task_id: str,
+  env_cfg: ManagerBasedRlEnvCfg,
+  *,
+  rank: int,
+  resume_path: Path | None,
+) -> None:
+  if task_id != _REACTIVE_SOCCER_TASK_ID:
+    return
+
+  from mjlab.tasks.soccer_reactive.odometry_artifacts import (
+    DEFAULT_REACTIVE_SOCCER_ODOMETRY_MODEL_PATH,
+    apply_training_odometry_artifact_binding,
+  )
+
+  default_env_cfg = load_env_cfg(task_id)
+  default_perception = getattr(default_env_cfg, "perception", SimpleNamespace())
+  current_perception = getattr(env_cfg, "perception", SimpleNamespace())
+  allow_bootstrap = (
+    str(getattr(current_perception, "localization_mode", ""))
+    == str(getattr(default_perception, "localization_mode", ""))
+    and str(getattr(current_perception, "odometry_model_path", "") or "")
+    == str(getattr(default_perception, "odometry_model_path", "") or "")
+  )
+  payload = apply_training_odometry_artifact_binding(
+    env_cfg,
+    checkpoint_path=resume_path,
+    bootstrap_localization_mode=("ground_truth" if allow_bootstrap else None),
+  )
+  if rank != 0:
+    return
+  binding_source = str(payload.get("binding_source", ""))
+  if binding_source == "checkpoint":
+    print(
+      "[INFO] Reactive soccer odometry restored from resume checkpoint: "
+      f"{payload.get('resolved_path', '')}"
+    )
+  elif binding_source == "default_checkpoint":
+    print(
+      "[INFO] Reactive soccer using default odometry checkpoint: "
+      f"{payload.get('resolved_path', DEFAULT_REACTIVE_SOCCER_ODOMETRY_MODEL_PATH)}"
+    )
+  elif binding_source == "bootstrap_localization":
+    print(
+      "[WARN] Reactive soccer odometry checkpoint is unavailable; "
+      "bootstrapping training with ground-truth localization. "
+      f"Requested mode: {payload.get('requested_localization_mode', 'unknown')}. "
+      f"Expected offline odometry checkpoint: {DEFAULT_REACTIVE_SOCCER_ODOMETRY_MODEL_PATH}"
+    )
+
+
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
+  cfg = _restore_task_dynamic_train_cfg_extensions(task_id, cfg)
   cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+  local_rank = 0
   if cuda_visible == "":
     device = "cpu"
     seed = cfg.agent.seed
@@ -78,6 +201,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     rank = int(os.environ.get("RANK", "0"))
     # Set EGL device to match the CUDA device.
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
+    torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
     # Set seed to have diversity in different processes.
     seed = cfg.agent.seed + local_rank
@@ -88,122 +212,144 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   cfg.env.seed = seed
 
   print(f"[INFO] Training with: device={device}, seed={seed}, rank={rank}")
+  initialized_distributed = _maybe_init_reactive_soccer_distributed(
+    task_id,
+    device,
+    rank=rank,
+  )
 
   registry_name: str | None = None
+  env = None
+  runner = None
 
-  # Check if this is a tracking task by checking for motion command.
-  is_tracking_task = "motion" in cfg.env.commands and isinstance(
-    cfg.env.commands["motion"], MotionCommandCfg
-  )
-
-  if is_tracking_task:
-    motion_cmd = cfg.env.commands["motion"]
-    assert isinstance(motion_cmd, MotionCommandCfg)
-
-    # Check if motion_file is already set (e.g., via CLI --env.commands.motion.motion-file).
-    if motion_cmd.motion_file and Path(motion_cmd.motion_file).exists():
-      print(f"[INFO] Using local motion file: {motion_cmd.motion_file}")
-    elif cfg.registry_name:
-      # Download from WandB registry.
-      registry_name = cast(str, cfg.registry_name)
-      if ":" not in registry_name:
-        registry_name = registry_name + ":latest"
-      import wandb
-
-      api = wandb.Api()
-      artifact = api.artifact(registry_name)
-      motion_cmd.motion_file = str(Path(artifact.download()) / "motion.npz")
-    else:
-      raise ValueError(
-        "For tracking tasks, provide either:\n"
-        "  --registry-name your-org/motions/motion-name (download from WandB)\n"
-        "  --env.commands.motion.motion-file /path/to/motion.npz (local file)"
-      )
-
-  # Enable NaN guard if requested.
-  if cfg.enable_nan_guard:
-    cfg.env.sim.nan_guard.enabled = True
-    print(f"[INFO] NaN guard enabled, output dir: {cfg.env.sim.nan_guard.output_dir}")
-
-  if rank == 0:
-    print(f"[INFO] Logging experiment in directory: {log_dir}")
-
-  env = ManagerBasedRlEnv(
-    cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
-  )
-
-  log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
-
-  resume_path: Path | None = None
-  if cfg.agent.resume:
-    if cfg.wandb_run_path is not None:
-      # Load checkpoint from W&B.
-      resume_path, was_cached = get_wandb_checkpoint_path(
-        log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
-      )
-      if rank == 0:
-        run_id = resume_path.parent.name
-        checkpoint_name = resume_path.name
-        cached_str = "cached" if was_cached else "downloaded"
-        print(
-          f"[INFO]: Loading checkpoint from W&B: {checkpoint_name} "
-          f"(run: {run_id}, {cached_str})"
-        )
-    else:
-      # Load checkpoint from local filesystem.
-      resume_path = get_checkpoint_path(
-        log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint
-      )
-
-  # Only record videos on rank 0 to avoid multiple workers writing to the same files.
-  if cfg.video and rank == 0:
-    env = VideoRecorder(
-      env,
-      video_folder=Path(log_dir) / "videos" / "train",
-      step_trigger=lambda step: step % cfg.video_interval == 0,
-      video_length=cfg.video_length,
-      disable_logger=True,
+  try:
+    # Check if this is a tracking task by checking for motion command.
+    is_tracking_task = "motion" in cfg.env.commands and isinstance(
+      cfg.env.commands["motion"], MotionCommandCfg
     )
-    print("[INFO] Recording videos during training.")
 
-  env = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
+    if is_tracking_task:
+      motion_cmd = cfg.env.commands["motion"]
+      assert isinstance(motion_cmd, MotionCommandCfg)
 
-  agent_cfg = _cfg_to_dict(cfg.agent)
-  env_cfg = _cfg_to_dict(cfg.env)
+      # Check if motion_file is already set (e.g., via CLI --env.commands.motion.motion-file).
+      if motion_cmd.motion_file and Path(motion_cmd.motion_file).exists():
+        print(f"[INFO] Using local motion file: {motion_cmd.motion_file}")
+      elif cfg.registry_name:
+        # Download from WandB registry.
+        registry_name = cast(str, cfg.registry_name)
+        if ":" not in registry_name:
+          registry_name = registry_name + ":latest"
+        import wandb
 
-  runner_cls = load_runner_cls(task_id)
-  if runner_cls is None:
-    runner_cls = MjlabOnPolicyRunner
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_cmd.motion_file = str(Path(artifact.download()) / "motion.npz")
+      else:
+        raise ValueError(
+          "For tracking tasks, provide either:\n"
+          "  --registry-name your-org/motions/motion-name (download from WandB)\n"
+          "  --env.commands.motion.motion-file /path/to/motion.npz (local file)"
+        )
 
-  runner_kwargs = {}
-  if is_tracking_task:
-    runner_kwargs["registry_name"] = registry_name
+    # Enable NaN guard if requested.
+    if cfg.enable_nan_guard:
+      cfg.env.sim.nan_guard.enabled = True
+      print(f"[INFO] NaN guard enabled, output dir: {cfg.env.sim.nan_guard.output_dir}")
 
-  # Write config files before runner creation, since the runner mutates agent_cfg
-  # in-place (e.g., injecting non-serializable objects).
-  if rank == 0:
-    dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
-    dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
+    if rank == 0:
+      print(f"[INFO] Logging experiment in directory: {log_dir}")
 
-  runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
+    log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
-  add_wandb_tags(cfg.agent.wandb_tags)
-  runner.add_git_repo_to_log(__file__)
-  if resume_path is not None:
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    runner.load(str(resume_path))
+    resume_path: Path | None = None
+    if cfg.agent.resume:
+      if cfg.wandb_run_path is not None:
+        # Load checkpoint from W&B.
+        resume_path, was_cached = get_wandb_checkpoint_path(
+          log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
+        )
+        if rank == 0:
+          run_id = resume_path.parent.name
+          checkpoint_name = resume_path.name
+          cached_str = "cached" if was_cached else "downloaded"
+          print(
+            f"[INFO]: Loading checkpoint from W&B: {checkpoint_name} "
+            f"(run: {run_id}, {cached_str})"
+          )
+      else:
+        # Load checkpoint from local filesystem.
+        resume_path = get_checkpoint_path(
+          log_root_path, cfg.agent.load_run, cfg.agent.load_checkpoint
+        )
 
-  runner.learn(
-    num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
-  )
-  if hasattr(runner, "close"):
-    runner.close()
+    _apply_task_specific_train_env_bindings(
+      task_id,
+      cfg.env,
+      rank=rank,
+      resume_path=resume_path,
+    )
 
-  env.close()
+    env = ManagerBasedRlEnv(
+      cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
+    )
+
+    # Only record videos on rank 0 to avoid multiple workers writing to the same files.
+    if cfg.video and rank == 0:
+      env = VideoRecorder(
+        env,
+        video_folder=Path(log_dir) / "videos" / "train",
+        step_trigger=lambda step: step % cfg.video_interval == 0,
+        video_length=cfg.video_length,
+        disable_logger=True,
+      )
+      print("[INFO] Recording videos during training.")
+
+    env = RslRlVecEnvWrapper(env, clip_actions=cfg.agent.clip_actions)
+
+    agent_cfg = _cfg_to_dict(cfg.agent)
+    env_cfg = _cfg_to_dict(cfg.env)
+
+    runner_cls = load_runner_cls(task_id)
+    if runner_cls is None:
+      runner_cls = MjlabOnPolicyRunner
+
+    runner_kwargs = {}
+    if is_tracking_task:
+      runner_kwargs["registry_name"] = registry_name
+
+    # Write config files before runner creation, since the runner mutates agent_cfg
+    # in-place (e.g., injecting non-serializable objects).
+    if rank == 0:
+      dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
+      dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
+
+    runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
+
+    add_wandb_tags(cfg.agent.wandb_tags)
+    runner.add_git_repo_to_log(__file__)
+    if resume_path is not None:
+      print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+      runner.load(str(resume_path))
+
+    runner.learn(
+      num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
+    )
+  finally:
+    try:
+      if runner is not None and hasattr(runner, "close"):
+        runner.close()
+    finally:
+      try:
+        if env is not None:
+          env.close()
+      finally:
+        _maybe_shutdown_distributed(initialized_distributed)
 
 
 def launch_training(task_id: str, args: TrainConfig | None = None):
   args = args or TrainConfig.from_task(task_id)
+  args = _restore_task_dynamic_train_cfg_extensions(task_id, args)
 
   # Create log directory once before launching workers.
   log_root_path = Path("logs") / "rsl_rl" / args.agent.experiment_name

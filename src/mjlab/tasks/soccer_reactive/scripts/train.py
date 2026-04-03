@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal
 
+import mjlab
 import tyro
 
 from mjlab.scripts.train import TrainConfig, launch_training as _launch_training
@@ -114,6 +115,7 @@ def parse_reactive_soccer_train_args(argv: list[str]) -> ReactiveSoccerTrainConf
     args=_normalize_cli_args(argv),
     default=build_reactive_soccer_train_cfg(),
     prog=sys.argv[0],
+    config=mjlab.TYRO_FLAGS,
   )
   args = _restore_reactive_env_extensions(args)
   return _apply_training_profile(args)

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import mjlab
 import tyro
 
 from mjlab.tasks.soccer_reactive.scripts.play import (
@@ -62,6 +63,7 @@ def main() -> None:
     ReactiveSoccerAblationArgs,
     prog=sys.argv[0],
     default=ReactiveSoccerAblationArgs(),
+    config=mjlab.TYRO_FLAGS,
   )
   run_eval_ablation(args)
 

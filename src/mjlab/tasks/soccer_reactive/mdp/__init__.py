@@ -55,11 +55,71 @@ from mjlab.tasks.soccer_reactive.mdp.observations import (
 from mjlab.tasks.soccer_reactive.mdp.observations import (
   privileged_base_mass_randomization as privileged_base_mass_randomization,
 )
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  FieldLandmarkMap as FieldLandmarkMap,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  FieldLandmarkSpec as FieldLandmarkSpec,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  LandmarkPerceptionConfig as LandmarkPerceptionConfig,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  VirtualLandmarkPerceptionChannel as VirtualLandmarkPerceptionChannel,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  build_field_landmark_map as build_field_landmark_map,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  build_field_landmark_specs as build_field_landmark_specs,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  build_landmark_observation as build_landmark_observation,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  landmark_positions_in_body_frame as landmark_positions_in_body_frame,
+)
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  sample_virtual_landmark_detections as sample_virtual_landmark_detections,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  LandmarkObservation as LandmarkObservation,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  ParticleFilterConfig as ParticleFilterConfig,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  ParticleFilterLocalizer as ParticleFilterLocalizer,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  compute_body_frame_delta as compute_body_frame_delta,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  goal_observation_from_pose as goal_observation_from_pose,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  integrate_delta_pose as integrate_delta_pose,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  rotate_body_to_field as rotate_body_to_field,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import (
+  rotate_field_to_body as rotate_field_to_body,
+)
+from mjlab.tasks.soccer_reactive.mdp.odometry import (
+  ReactiveSoccerLearnedOdometryRuntime as ReactiveSoccerLearnedOdometryRuntime,
+)
 from mjlab.tasks.soccer_reactive.mdp.odometry import (
   ReactiveSoccerOdometryProxy as ReactiveSoccerOdometryProxy,
 )
 from mjlab.tasks.soccer_reactive.mdp.odometry import (
+  ReactiveSoccerOdometryStats as ReactiveSoccerOdometryStats,
+)
+from mjlab.tasks.soccer_reactive.mdp.odometry import (
   build_odometry_proprio_vector as build_odometry_proprio_vector,
+)
+from mjlab.tasks.soccer_reactive.mdp.odometry import (
+  get_ground_truth_field_pose as get_ground_truth_field_pose,
 )
 from mjlab.tasks.soccer_reactive.mdp.perception import (
   VirtualPerceptionChannel as VirtualPerceptionChannel,
@@ -131,6 +191,9 @@ from mjlab.tasks.soccer_reactive.mdp.rewards import (
 )
 from mjlab.tasks.soccer_reactive.mdp.rewards import (
   touch_ball_reward as touch_ball_reward,
+)
+from mjlab.tasks.soccer_reactive.mdp.rewards import (
+  upright_reward as upright_reward,
 )
 from mjlab.tasks.soccer_reactive.mdp.rewards import (
   survival_reward as survival_reward,

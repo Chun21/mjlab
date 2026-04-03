@@ -111,14 +111,16 @@ class MotionClipResetEvent:
     motion_root: str,
     asset_cfg: SceneEntityCfg,
   ) -> None:
-    del probability, motion_root, asset_cfg
+    del motion_root, asset_cfg
 
     if env_ids is None or isinstance(env_ids, slice):
       env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    if len(env_ids) == 0 or self._probability <= 0.0:
+    active_probability = float(probability)
+    self._probability = active_probability
+    if len(env_ids) == 0 or active_probability <= 0.0:
       return
 
-    sampled_mask = torch.rand(len(env_ids), device=env.device) < self._probability
+    sampled_mask = torch.rand(len(env_ids), device=env.device) < active_probability
     selected_env_ids = env_ids[sampled_mask]
     if len(selected_env_ids) == 0:
       return

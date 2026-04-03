@@ -3,18 +3,32 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import mjlab
 import torch
 import tyro
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
-from mjlab.scripts.play import PlayConfig, run_play as _run_play
+from mjlab.scripts.play import PlayConfig
+from mjlab.scripts.train import _cfg_to_dict
+from mjlab.tasks.soccer_reactive.config.g1_comp.env_cfgs import (
+  g1_comp_reactive_soccer_env_cfg,
+)
+from mjlab.utils.os import get_wandb_checkpoint_path
+from mjlab.utils.torch import configure_torch_backends
+from mjlab.utils.wrappers import VideoRecorder
+from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from mjlab.tasks.registry import load_rl_cfg, load_runner_cls
+from mjlab.tasks.soccer_reactive.odometry_artifacts import (
+  apply_odometry_artifact_binding,
+  apply_training_odometry_artifact_binding,
+)
 
 TASK_ID = "Mjlab-Soccer-G1-Comp-ReactivePaper"
 _FIXED_EVAL_SEED_SETS = {
@@ -28,6 +42,8 @@ class ReactiveSoccerEvalArgs(PlayConfig):
   metrics_json: Path | None = None
   num_episodes: int = 1
   fixed_seed_set: str = "default"
+  odometry_model_path: str | None = None
+  localization_mode: str | None = None
 
 
 def build_eval_args(
@@ -106,7 +122,12 @@ def _make_policy(cfg: ReactiveSoccerEvalArgs, env: RslRlVecEnvWrapper) -> callab
 
   agent_cfg = load_rl_cfg(TASK_ID)
   runner_cls = load_runner_cls(TASK_ID) or MjlabOnPolicyRunner
-  runner = runner_cls(env, asdict(agent_cfg), device=str(env.device))
+  runner = runner_cls(
+    env,
+    _cfg_to_dict(agent_cfg),
+    device=str(env.device),
+    enable_distributed=False,
+  )
   runner.load(str(cfg.checkpoint_file), map_location=str(env.device))
   return runner.get_inference_policy(device=str(env.device))
 
@@ -194,6 +215,37 @@ def _collect_eval_metrics(cfg: ReactiveSoccerEvalArgs) -> dict[str, object]:
     num_envs=num_envs,
     fixed_seed_set=cfg.fixed_seed_set,
   )
+  if cfg.agent in {"zero", "random"}:
+    apply_odometry_artifact_binding(
+      env_cfg,
+      checkpoint_path=None,
+      odometry_model_path=cfg.odometry_model_path,
+      localization_mode=(
+        cfg.localization_mode
+        if cfg.localization_mode is not None
+        else "ground_truth"
+      ),
+    )
+  elif cfg.localization_mode is not None or cfg.odometry_model_path is not None:
+    apply_odometry_artifact_binding(
+      env_cfg,
+      checkpoint_path=cfg.checkpoint_file,
+      odometry_model_path=cfg.odometry_model_path,
+      localization_mode=cfg.localization_mode,
+    )
+  else:
+    odometry_payload = apply_training_odometry_artifact_binding(
+      env_cfg,
+      checkpoint_path=cfg.checkpoint_file,
+      bootstrap_localization_mode="ground_truth",
+    )
+    if odometry_payload.get("binding_source") == "bootstrap_localization":
+      print(
+        "[WARN] Periodic reactive-soccer eval is bootstrapping with "
+        "ground-truth localization because no learned odometry checkpoint "
+        "could be resolved from the training checkpoint.",
+        flush=True,
+      )
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   wrapped = RslRlVecEnvWrapper(env, clip_actions=load_rl_cfg(TASK_ID).clip_actions)
   try:
@@ -325,12 +377,155 @@ def _write_metrics_json(path: Path, metrics: dict[str, object]) -> None:
   path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
 
 
+
+def _run_standard_play(cfg: PlayConfig | ReactiveSoccerEvalArgs) -> None:
+  configure_torch_backends()
+  device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+  env_cfg = g1_comp_reactive_soccer_env_cfg(play=True)
+  agent_cfg = load_rl_cfg(TASK_ID)
+
+  dummy_mode = cfg.agent in {"zero", "random"}
+  trained_mode = not dummy_mode
+
+  if cfg.no_terminations:
+    env_cfg.terminations = {}
+    print("[INFO]: Terminations disabled")
+
+  log_dir: Path | None = None
+  resume_path: Path | None = None
+  if trained_mode:
+    log_root_path = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
+    if cfg.checkpoint_file is not None:
+      resume_path = Path(cfg.checkpoint_file)
+      if not resume_path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
+      print(f"[INFO]: Loading checkpoint: {resume_path.name}")
+    else:
+      if cfg.wandb_run_path is None:
+        raise ValueError(
+          "`wandb_run_path` is required when `checkpoint_file` is not provided."
+        )
+      resume_path, was_cached = get_wandb_checkpoint_path(
+        log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
+      )
+      run_id = resume_path.parent.name
+      checkpoint_name = resume_path.name
+      cached_str = "cached" if was_cached else "downloaded"
+      print(
+        f"[INFO]: Loading checkpoint: {checkpoint_name} (run: {run_id}, {cached_str})"
+      )
+    log_dir = resume_path.parent
+
+  if cfg.num_envs is not None:
+    env_cfg.scene.num_envs = cfg.num_envs
+  if cfg.video_height is not None:
+    env_cfg.viewer.height = cfg.video_height
+  if cfg.video_width is not None:
+    env_cfg.viewer.width = cfg.video_width
+
+  if dummy_mode:
+    apply_odometry_artifact_binding(
+      env_cfg,
+      checkpoint_path=None,
+      odometry_model_path=getattr(cfg, "odometry_model_path", None),
+      localization_mode=(
+        getattr(cfg, "localization_mode", None)
+        if getattr(cfg, "localization_mode", None) is not None
+        else "ground_truth"
+      ),
+    )
+  elif (
+    getattr(cfg, "localization_mode", None) is not None
+    or getattr(cfg, "odometry_model_path", None) is not None
+  ):
+    apply_odometry_artifact_binding(
+      env_cfg,
+      checkpoint_path=resume_path,
+      odometry_model_path=getattr(cfg, "odometry_model_path", None),
+      localization_mode=getattr(cfg, "localization_mode", None),
+    )
+  else:
+    odometry_payload = apply_training_odometry_artifact_binding(
+      env_cfg,
+      checkpoint_path=resume_path,
+      bootstrap_localization_mode="ground_truth",
+    )
+    if odometry_payload.get("binding_source") == "bootstrap_localization":
+      print(
+        "[WARN] Play mode is bootstrapping with ground-truth localization "
+        "because no learned odometry checkpoint could be resolved.",
+        flush=True,
+      )
+
+  render_mode = "rgb_array" if (trained_mode and cfg.video) else None
+  if cfg.video and dummy_mode:
+    print("[WARN] Video recording with dummy agents is disabled (no checkpoint/log_dir).")
+  env = ManagerBasedRlEnv(cfg=env_cfg, device=device, render_mode=render_mode)
+
+  if trained_mode and cfg.video:
+    print("[INFO] Recording videos during play")
+    assert log_dir is not None
+    env = VideoRecorder(
+      env,
+      video_folder=log_dir / "videos" / "play",
+      step_trigger=lambda step: step == 0,
+      video_length=cfg.video_length,
+      disable_logger=True,
+    )
+
+  env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+  if dummy_mode:
+    action_shape: tuple[int, ...] = env.unwrapped.action_space.shape
+    if cfg.agent == "zero":
+
+      class PolicyZero:
+        def __call__(self, obs) -> torch.Tensor:
+          del obs
+          return torch.zeros(action_shape, device=env.unwrapped.device)
+
+      policy = PolicyZero()
+    else:
+
+      class PolicyRandom:
+        def __call__(self, obs) -> torch.Tensor:
+          del obs
+          return 2 * torch.rand(action_shape, device=env.unwrapped.device) - 1
+
+      policy = PolicyRandom()
+  else:
+    runner_cls = load_runner_cls(TASK_ID) or MjlabOnPolicyRunner
+    runner = runner_cls(
+      env,
+      _cfg_to_dict(agent_cfg),
+      device=device,
+      enable_distributed=False,
+    )
+    runner.load(
+      str(resume_path), load_cfg={"actor": True}, strict=True, map_location=device
+    )
+    policy = runner.get_inference_policy(device=device)
+
+  if cfg.viewer == "auto":
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    resolved_viewer = "native" if has_display else "viser"
+  else:
+    resolved_viewer = cfg.viewer
+
+  if resolved_viewer == "native":
+    NativeMujocoViewer(env, policy).run()
+  elif resolved_viewer == "viser":
+    ViserPlayViewer(env, policy).run()
+  else:
+    raise RuntimeError(f"Unsupported viewer backend: {resolved_viewer}")
+
+  env.close()
+
 def run_play(cfg: PlayConfig | ReactiveSoccerEvalArgs) -> None:
   if isinstance(cfg, ReactiveSoccerEvalArgs) and cfg.metrics_json is not None:
     metrics = _collect_eval_metrics(cfg)
     _write_metrics_json(cfg.metrics_json, metrics)
     return
-  _run_play(TASK_ID, cfg)
+  _run_standard_play(cfg)
 
 
 def main() -> None:
@@ -338,6 +533,7 @@ def main() -> None:
     ReactiveSoccerEvalArgs,
     default=ReactiveSoccerEvalArgs(),
     prog=sys.argv[0],
+    config=mjlab.TYRO_FLAGS,
   )
   run_play(args)
 

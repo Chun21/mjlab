@@ -8,6 +8,10 @@ import torch
 class ReactiveRolloutStorage:
   """Track dual-critic values, returns and reconstruction targets."""
 
+  @staticmethod
+  def _sanitize_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
   def __init__(
     self,
     num_envs: int,
@@ -89,23 +93,23 @@ class ReactiveRolloutStorage:
       raise RuntimeError("ReactiveRolloutStorage is full")
 
     idx = self.step
-    self.actor_current[idx].copy_(actor_current)
+    self.actor_current[idx].copy_(self._sanitize_tensor(actor_current))
     if critic_current is None:
       critic_current = actor_current
-    self.critic_current[idx].copy_(critic_current)
+    self.critic_current[idx].copy_(self._sanitize_tensor(critic_current))
     if self.actor_history is not None and actor_history is not None:
-      self.actor_history[idx].copy_(actor_history)
+      self.actor_history[idx].copy_(self._sanitize_tensor(actor_history))
     if self.critic_privileged is not None and critic_privileged is not None:
-      self.critic_privileged[idx].copy_(critic_privileged)
-    self.actions[idx].copy_(actions)
-    self.old_action_mean[idx].copy_(old_action_mean)
-    self.old_log_probs[idx].copy_(old_log_probs)
-    self.goal_values[idx].copy_(goal_values)
-    self.aux_values[idx].copy_(aux_values)
-    self.goal_rewards[idx].copy_(goal_rewards)
-    self.aux_rewards[idx].copy_(aux_rewards)
-    self.dones[idx].copy_(dones)
-    self.reconstruction_targets[idx].copy_(reconstruction_targets)
+      self.critic_privileged[idx].copy_(self._sanitize_tensor(critic_privileged))
+    self.actions[idx].copy_(self._sanitize_tensor(actions))
+    self.old_action_mean[idx].copy_(self._sanitize_tensor(old_action_mean))
+    self.old_log_probs[idx].copy_(self._sanitize_tensor(old_log_probs))
+    self.goal_values[idx].copy_(self._sanitize_tensor(goal_values))
+    self.aux_values[idx].copy_(self._sanitize_tensor(aux_values))
+    self.goal_rewards[idx].copy_(self._sanitize_tensor(goal_rewards))
+    self.aux_rewards[idx].copy_(self._sanitize_tensor(aux_rewards))
+    self.dones[idx].copy_(self._sanitize_tensor(dones))
+    self.reconstruction_targets[idx].copy_(self._sanitize_tensor(reconstruction_targets))
     self.step += 1
 
   def compute_returns(
@@ -118,19 +122,21 @@ class ReactiveRolloutStorage:
     steps = self.step
     goal_adv = torch.zeros((self.num_envs, 1), device=self.device)
     aux_adv = torch.zeros((self.num_envs, 1), device=self.device)
+    next_goal_value = self._sanitize_tensor(next_goal_value)
+    next_aux_value = self._sanitize_tensor(next_aux_value)
     for idx in reversed(range(steps)):
-      not_done = 1.0 - self.dones[idx]
+      not_done = 1.0 - self._sanitize_tensor(self.dones[idx])
       next_gv = next_goal_value if idx == steps - 1 else self.goal_values[idx + 1]
       next_av = next_aux_value if idx == steps - 1 else self.aux_values[idx + 1]
 
       goal_delta = self.goal_rewards[idx] + gamma * next_gv * not_done - self.goal_values[idx]
       aux_delta = self.aux_rewards[idx] + gamma * next_av * not_done - self.aux_values[idx]
-      goal_adv = goal_delta + gamma * lam * not_done * goal_adv
-      aux_adv = aux_delta + gamma * lam * not_done * aux_adv
+      goal_adv = self._sanitize_tensor(goal_delta + gamma * lam * not_done * goal_adv)
+      aux_adv = self._sanitize_tensor(aux_delta + gamma * lam * not_done * aux_adv)
       self.goal_advantages[idx].copy_(goal_adv)
       self.aux_advantages[idx].copy_(aux_adv)
-      self.goal_returns[idx].copy_(goal_adv + self.goal_values[idx])
-      self.aux_returns[idx].copy_(aux_adv + self.aux_values[idx])
+      self.goal_returns[idx].copy_(self._sanitize_tensor(goal_adv + self.goal_values[idx]))
+      self.aux_returns[idx].copy_(self._sanitize_tensor(aux_adv + self.aux_values[idx]))
 
   def flattened_batch(self) -> dict[str, torch.Tensor]:
     steps = self.step

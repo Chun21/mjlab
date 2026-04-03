@@ -84,6 +84,11 @@ def survival_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
   return envs_mdp.is_alive(env)
 
 
+def upright_reward(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Reward keeping the torso upright."""
+  return soccer_rewards.upright_reward(env)
+
+
 def fall_termination_penalty(
   env: ManagerBasedRlEnv,
   termination_term_name: str = "robot_fallen",
@@ -277,10 +282,12 @@ def non_foot_collision_penalty(
     data = sensor.data
     if data.force_history is not None:
       force_mag = torch.norm(data.force_history, dim=-1)
-      hit = (force_mag > force_threshold).any(dim=1)
-      return hit.sum(dim=-1).float()
+      hit = (force_mag > force_threshold)
+      hit = hit.reshape(hit.shape[0], -1).any(dim=1)
+      return hit.float()
     if data.found is not None:
-      return data.found.sum(dim=-1).float()
+      found = data.found.bool().reshape(data.found.shape[0], -1).any(dim=1)
+      return found.float()
   fallback = getattr(env, "_soccer_reactive_non_foot_collision_force", None)
   if fallback is not None:
     return fallback.to(env.device)

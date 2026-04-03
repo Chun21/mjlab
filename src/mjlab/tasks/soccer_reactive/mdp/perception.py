@@ -10,11 +10,20 @@ import torch
 from mjlab.asset_zoo.robots import G1_COMP_BODY_JOINT_NAMES
 from mjlab.envs import mdp as envs_mdp
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.tasks.soccer.field_specs import M_FIELD
+from mjlab.tasks.soccer_reactive.mdp.landmarks import (
+  LandmarkPerceptionConfig,
+  VirtualLandmarkPerceptionChannel,
+  build_field_landmark_map,
+  build_landmark_observation,
+  sample_virtual_landmark_detections,
+)
+from mjlab.tasks.soccer_reactive.mdp.localization_filter import ParticleFilterConfig
+from mjlab.tasks.soccer_reactive.mdp.odometry import (
+  ReactiveSoccerOdometryProxy,
+  get_ground_truth_field_pose,
+)
 from mjlab.tasks.soccer.mdp import observations as soccer_obs
-from mjlab.tasks.soccer_reactive.mdp.odometry import ReactiveSoccerOdometryProxy
 
-_RIGHT_GOAL_POS_W = (M_FIELD.field_length * 0.5, 0.0, M_FIELD.ball_radius)
 _PERCEPTION_RUNTIME_ATTR = "_soccer_reactive_perception_runtime"
 
 
@@ -60,7 +69,7 @@ class VirtualPerceptionState:
     self._mask_history.append(mask.clone())
     self._push_count += 1
 
-    history_index = max(0, len(self._obs_history) - self.latency_steps)
+    history_index = max(0, len(self._obs_history) - 1 - self.latency_steps)
     should_update = self._held_obs is None or (
       (self._push_count - 1) % max(self.update_interval_steps, 1) == 0
     )
@@ -230,17 +239,18 @@ class ReactiveSoccerPerceptionRuntime:
 
   def __init__(self, env) -> None:
     self.device = env.device
+    self._env = env
     self._last_step = -1
     self._joint_cfg = SceneEntityCfg("robot", joint_names=G1_COMP_BODY_JOINT_NAMES)
     self._joint_cfg.resolve(env.scene)
 
     perception_cfg = getattr(env.cfg, "perception", None)
     camera_hz = float(getattr(perception_cfg, "camera_hz", 30.0))
-    odom_hz = float(getattr(perception_cfg, "odom_hz", 20.0))
     detection_mean_hz = float(getattr(perception_cfg, "detection_mean_hz", 25.36))
     detection_std_hz = float(getattr(perception_cfg, "detection_std_hz", 1.06))
     latency_mean_s = float(getattr(perception_cfg, "latency_mean_s", 0.116))
     latency_std_s = float(getattr(perception_cfg, "latency_std_s", 0.018))
+
     self.ball_channel = VirtualPerceptionChannel(
       num_envs=env.num_envs,
       obs_dim=2,
@@ -251,23 +261,72 @@ class ReactiveSoccerPerceptionRuntime:
       mean_latency_s=latency_mean_s,
       latency_std_s=latency_std_s,
     )
-    self.odometry = ReactiveSoccerOdometryProxy(
+
+    self.landmark_map = build_field_landmark_map(device=env.device)
+    self.landmark_perception_cfg = LandmarkPerceptionConfig(
+      fov_half_angle_deg=float(getattr(perception_cfg, "landmark_fov_half_angle_deg", 90.0)),
+      max_range_m=float(getattr(perception_cfg, "landmark_max_range_m", 12.0)),
+      near_probability=float(getattr(perception_cfg, "landmark_near_probability", 0.9)),
+      guaranteed_range_m=float(getattr(perception_cfg, "landmark_guaranteed_range_m", 7.0)),
+      decay_distance_m=float(getattr(perception_cfg, "landmark_decay_distance_m", 3.0)),
+      dropout_prob=float(getattr(perception_cfg, "landmark_dropout_prob", 0.05)),
+      noise_std_base_m=float(getattr(perception_cfg, "landmark_noise_std_base_m", 0.03)),
+      noise_std_scale_per_m=float(getattr(perception_cfg, "landmark_noise_std_scale_per_m", 0.01)),
+    )
+    self._pending_landmark_measurement = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    self.landmark_channel = VirtualLandmarkPerceptionChannel(
       num_envs=env.num_envs,
+      num_landmarks=self.landmark_map.num_landmarks,
       device=env.device,
       step_dt=env.step_dt,
-      history_steps=int(getattr(env.cfg, "control_hz", 50)),
-      update_hz=odom_hz,
+      mean_frequency_hz=float(getattr(perception_cfg, "landmark_mean_hz", detection_mean_hz)),
+      frequency_std_hz=float(getattr(perception_cfg, "landmark_std_hz", detection_std_hz)),
+      mean_latency_s=float(getattr(perception_cfg, "landmark_latency_mean_s", latency_mean_s)),
+      latency_std_s=float(getattr(perception_cfg, "landmark_latency_std_s", latency_std_s)),
+    )
+
+    joint_dim = (
+      len(self._joint_cfg.joint_ids)
+      if isinstance(self._joint_cfg.joint_ids, list)
+      else len(G1_COMP_BODY_JOINT_NAMES)
+    )
+    action_dim = int(getattr(env.action_manager, "total_action_dim", joint_dim))
+    proprio_dim = 3 + 3 + joint_dim + joint_dim + action_dim
+    self.odometry = ReactiveSoccerOdometryProxy(
+      env=env,
+      field_landmarks_f=self.landmark_map.positions_f,
+      history_steps=int(getattr(perception_cfg, "odometry_history_steps", 50)),
+      update_hz=float(getattr(perception_cfg, "odometry_update_hz", 20.0)),
+      localization_mode=str(getattr(perception_cfg, "localization_mode", "particle_filter")),
+      odometry_model_path=str(getattr(perception_cfg, "odometry_model_path", "") or ""),
+      pf_cfg=ParticleFilterConfig(
+        num_particles=int(getattr(perception_cfg, "pf_num_particles", 128)),
+        resample_threshold=float(getattr(perception_cfg, "pf_resample_threshold", 0.5)),
+        motion_noise_xy=float(getattr(perception_cfg, "pf_motion_noise_xy", 0.03)),
+        motion_noise_yaw=float(getattr(perception_cfg, "pf_motion_noise_yaw", 0.05)),
+        measurement_sigma=float(getattr(perception_cfg, "pf_measurement_sigma", 0.15)),
+        initial_xy_std=float(getattr(perception_cfg, "pf_initial_xy_std", 0.02)),
+        initial_yaw_std=float(getattr(perception_cfg, "pf_initial_yaw_std", 0.05)),
+      ),
+      expected_proprio_dim=proprio_dim,
     )
 
   def reset(self, env_ids: torch.Tensor | None = None) -> None:
     self.ball_channel.reset(env_ids)
+    self.landmark_channel.reset(env_ids)
     self.odometry.reset(env_ids)
+    if env_ids is None:
+      self._pending_landmark_measurement[:] = False
+    else:
+      self._pending_landmark_measurement[env_ids] = False
     self._last_step = -1
 
   def update(self, env) -> None:
     step = int(env.common_step_counter)
     if self._last_step == step:
       return
+
+    true_pose_f = get_ground_truth_field_pose(env)
 
     ball_pos_b = soccer_obs.ball_pos_b(env)[:, :2]
     distance = torch.norm(ball_pos_b, dim=1)
@@ -283,15 +342,46 @@ class ReactiveSoccerPerceptionRuntime:
       noise_std=ball_noise_std(distance),
     )
 
-    goal_pos_b = soccer_obs.goal_pos_b(env, _RIGHT_GOAL_POS_W)[:, :2]
+    landmark_true_b, landmark_detect_mask, landmark_noise_std = sample_virtual_landmark_detections(
+      pose_f=true_pose_f,
+      landmark_positions_f=self.landmark_map.positions_f,
+      cfg=self.landmark_perception_cfg,
+    )
+    self.landmark_channel.advance(
+      true_obs=landmark_true_b,
+      detection_mask=landmark_detect_mask,
+      noise_std=landmark_noise_std,
+    )
+    landmark_pos_b, landmark_mask, landmark_age, landmark_publish = self.landmark_channel.read()
+    self._pending_landmark_measurement |= landmark_publish
+    landmark_observation = build_landmark_observation(
+      landmark_pos_b,
+      landmark_mask,
+      landmark_age,
+    )
+
     self.odometry.advance(
-      true_goal_pos_b=goal_pos_b,
+      true_pose_f=true_pose_f,
+      landmark_observation=landmark_observation,
+      landmark_measurement_fresh=self._pending_landmark_measurement,
       projected_gravity=envs_mdp.projected_gravity(env),
       base_ang_vel=envs_mdp.base_ang_vel(env),
       joint_pos=envs_mdp.joint_pos_rel(env, asset_cfg=self._joint_cfg),
       joint_vel=envs_mdp.joint_vel_rel(env, asset_cfg=self._joint_cfg),
       previous_action=envs_mdp.last_action(env),
     )
+
+    self._pending_landmark_measurement[self.odometry.last_update_mask] = False
+
+    odom_stats = self.odometry.latest_stats
+    setattr(env, "_soccer_reactive_pose_hat_f", self.odometry.pose_hat_f.clone())
+    setattr(env, "_soccer_reactive_goal_obs_age", self.odometry.goal_obs_age.clone())
+    setattr(env, "_soccer_reactive_localization_success", odom_stats.localization_success.clone())
+    setattr(env, "_soccer_reactive_visible_landmarks", odom_stats.visible_landmarks.clone())
+    setattr(env, "_soccer_reactive_pose_error_xy", odom_stats.pose_error_xy.clone())
+    setattr(env, "_soccer_reactive_pose_error_yaw", odom_stats.pose_error_yaw.clone())
+    if odom_stats.particle_effective_n is not None:
+      setattr(env, "_soccer_reactive_pf_effective_n", odom_stats.particle_effective_n.clone())
     self._last_step = step
 
   def read_ball(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

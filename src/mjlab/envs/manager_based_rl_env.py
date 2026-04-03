@@ -146,6 +146,15 @@ class ManagerBasedRlEnvCfg:
   partial_reset_event_name: str | None = None
   """Event term name invoked during partial resets."""
 
+  partial_reset_as_done: bool = True
+  """Whether partial resets should still be surfaced as terminal transitions.
+
+  When True (default), the environment is allowed to perform a lightweight reset
+  (for example, only resetting a ball) while still returning ``done=True`` to
+  the RL algorithm. This keeps rollout semantics aligned with episode-state
+  resets for reward/observation histories.
+  """
+
   preserve_observation_history_on_partial_reset: bool = False
   """Keep observation history buffers across partial resets."""
 
@@ -380,6 +389,11 @@ class ManagerBasedRlEnv:
       (``write_root_state_to_sim``, ``write_joint_state_to_sim``, etc.).
       See :ref:`faq` for details.
     """
+    self.extras["log"] = dict()
+    self.extras["episode_reset_count"] = 0
+    self.extras["partial_reset_count"] = 0
+    self.extras["full_reset_count"] = 0
+
     self.action_manager.process_action(action.to(self.device))
 
     for _ in range(self.cfg.decimation):
@@ -415,9 +429,11 @@ class ManagerBasedRlEnv:
     partial_reset_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
     full_reset_env_ids = torch.empty(0, device=self.device, dtype=torch.long)
     if len(reset_env_ids) > 0:
-      self.extras["log"] = dict()
       partial_reset_env_ids, full_reset_env_ids = self._split_reset_env_ids(reset_env_ids)
-      if len(partial_reset_env_ids) > 0:
+      self.extras["episode_reset_count"] = int(len(reset_env_ids))
+      self.extras["partial_reset_count"] = int(len(partial_reset_env_ids))
+      self.extras["full_reset_count"] = int(len(full_reset_env_ids))
+      if len(partial_reset_env_ids) > 0 and not self.cfg.partial_reset_as_done:
         self.reset_buf[partial_reset_env_ids] = False
         self.reset_terminated[partial_reset_env_ids] = False
         self.reset_time_outs[partial_reset_env_ids] = False

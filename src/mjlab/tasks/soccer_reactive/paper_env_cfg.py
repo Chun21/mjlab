@@ -161,8 +161,11 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
 
+  # Tuned with reward-share diagnostics so AMP is no longer numerically drowned out
+  # by collision penalties during early reactive-soccer training.
   cfg.rewards = {
     "survival": RewardTermCfg(func=mdp.survival_reward, weight=3.0),
+    "upright": RewardTermCfg(func=mdp.upright_reward, weight=2.0),
     "termination": RewardTermCfg(func=mdp.fall_termination_penalty, weight=-1000.0),
     "stagnation": RewardTermCfg(func=mdp.StagnationPenalty, weight=-100.0),
     "goal_scored": RewardTermCfg(func=mdp.goal_scored_reward, weight=15.0),
@@ -171,9 +174,9 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     "ball_goal_alignment": RewardTermCfg(
       func=mdp.ball_goal_alignment_reward, weight=0.0
     ),
-    "touch_ball": RewardTermCfg(func=mdp.touch_ball_impulse_reward, weight=0.0),
+    "touch_ball": RewardTermCfg(func=mdp.touch_ball_impulse_reward, weight=15.0),
     "robot_ball_alignment": RewardTermCfg(
-      func=mdp.robot_ball_alignment_reward, weight=0.0
+      func=mdp.robot_ball_alignment_reward, weight=10.0
     ),
     "head_pitch_alignment": RewardTermCfg(
       func=mdp.head_pitch_alignment_penalty, weight=-0.5
@@ -189,7 +192,7 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       func=mdp.foot_proximity_penalty, weight=-5.0
     ),
     "near_ball_control": RewardTermCfg(
-      func=mdp.near_ball_control_reward, weight=0.0
+      func=mdp.near_ball_control_reward, weight=5.0
     ),
     "head_action_rate_penalty": RewardTermCfg(
       func=mdp.head_action_rate_penalty,
@@ -206,7 +209,7 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       weight=-100.0,
       params={"sensor_name": non_foot_collision_cfg.name, "force_threshold": 10.0},
     ),
-    "amp_style": RewardTermCfg(func=mdp.amp_style_reward, weight=0.3),
+    "amp_style": RewardTermCfg(func=mdp.amp_style_reward, weight=40.0),
   }
 
   cfg.terminations = {
@@ -231,19 +234,18 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
 
-  reset_from_motion_prob = 0.5
-  cfg.reset_from_motion_prob = reset_from_motion_prob
+  final_reset_from_motion_prob = 0.5
   training_curriculum = SimpleNamespace(
-    phase1_end_iter=500,
-    phase2_end_iter=1500,
+    phase1_end_iter=1000,
+    phase2_end_iter=3000,
     phase1_ball_pose_range={
-      "x": (0.5, 2.0),
-      "y": (-1.0, 1.0),
+      "x": (-1.15, -0.45),
+      "y": (-0.6, 0.6),
       "z": (0.0, 0.0),
     },
     phase2_ball_pose_range={
-      "x": (0.0, 4.0),
-      "y": (-2.0, 2.0),
+      "x": (-1.25, 1.0),
+      "y": (-1.5, 1.5),
       "z": (0.0, 0.0),
     },
     phase3_ball_pose_range={
@@ -251,7 +253,23 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "y": (-3.5, 3.5),
       "z": (0.0, 0.0),
     },
+    phase1_reset_from_motion_prob=0.5,
+    phase2_reset_from_motion_prob=0.2,
+    phase3_reset_from_motion_prob=final_reset_from_motion_prob,
+    phase1_ball_teleport_prob=0.0,
+    phase2_ball_teleport_prob=0.15,
+    phase3_ball_teleport_prob=0.35,
+    phase1_ball_velocity_prob=0.0,
+    phase2_ball_velocity_prob=0.25,
+    phase3_ball_velocity_prob=0.5,
+    phase1_robot_velocity_prob=0.0,
+    phase2_robot_velocity_prob=0.1,
+    phase3_robot_velocity_prob=0.4,
+    phase1_robot_push_prob=0.0,
+    phase2_robot_push_prob=0.1,
+    phase3_robot_push_prob=0.3,
   )
+  cfg.reset_from_motion_prob = training_curriculum.phase1_reset_from_motion_prob
   cfg.training_curriculum = training_curriculum
 
   cfg.events["motion_clip_reset"] = EventTermCfg(
@@ -259,7 +277,7 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     mode="reset",
     params={
       "motion_root": str(Path("data/soccer_amp/motions_unified")),
-      "probability": reset_from_motion_prob,
+      "probability": cfg.reset_from_motion_prob,
       "asset_cfg": SceneEntityCfg("robot", joint_names=G1_COMP_BODY_JOINT_NAMES),
     },
   )
@@ -289,8 +307,8 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     mode="interval",
     interval_range_s=(4.0, 8.0),
     params={
-      "pose_range": training_curriculum.phase3_ball_pose_range,
-      "probability": 0.35,
+      "pose_range": training_curriculum.phase1_ball_pose_range,
+      "probability": training_curriculum.phase1_ball_teleport_prob,
     },
   )
   cfg.events["ball_velocity_disturbance"] = EventTermCfg(
@@ -302,7 +320,7 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "x": (-1.5, 1.5),
         "y": (-1.5, 1.5),
       },
-      "probability": 0.5,
+      "probability": training_curriculum.phase1_ball_velocity_prob,
       "asset_cfg": SceneEntityCfg("ball"),
     },
   )
@@ -317,7 +335,7 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "roll": (-0.3, 0.3),
         "pitch": (-0.3, 0.3),
       },
-      "probability": 0.4,
+      "probability": training_curriculum.phase1_robot_velocity_prob,
       "asset_cfg": SceneEntityCfg("robot"),
     },
   )
@@ -329,7 +347,7 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       "torque_range": (-5.0, 5.0),
       "duration_s": (0.05, 0.15),
       "cooldown_s": (1.5, 3.0),
-      "probability": 0.3,
+      "probability": training_curriculum.phase1_robot_push_prob,
       "asset_cfg": SceneEntityCfg("robot", body_names=("pelvis",)),
       "body_point_offset": (0.0, 0.0, 0.1),
     },
@@ -337,15 +355,39 @@ def make_reactive_soccer_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.control_hz = 50
   cfg.perception = SimpleNamespace(
     camera_hz=30,
+    odometry_history_steps=50,
+    odometry_update_hz=20,
     odom_hz=20,
+    localization_mode="particle_filter",
+    odometry_model_path="",
     detection_mean_hz=25.36,
     detection_std_hz=1.06,
     latency_mean_s=0.116,
     latency_std_s=0.018,
+    landmark_mean_hz=25.36,
+    landmark_std_hz=1.06,
+    landmark_latency_mean_s=0.116,
+    landmark_latency_std_s=0.018,
+    landmark_fov_half_angle_deg=90.0,
+    landmark_max_range_m=12.0,
+    landmark_near_probability=0.9,
+    landmark_guaranteed_range_m=7.0,
+    landmark_decay_distance_m=3.0,
+    landmark_dropout_prob=0.05,
+    landmark_noise_std_base_m=0.03,
+    landmark_noise_std_scale_per_m=0.01,
+    pf_num_particles=128,
+    pf_resample_threshold=0.5,
+    pf_motion_noise_xy=0.03,
+    pf_motion_noise_yaw=0.05,
+    pf_measurement_sigma=0.15,
+    pf_initial_xy_std=0.02,
+    pf_initial_yaw_std=0.05,
   )
-  cfg.scale_rewards_by_dt = False
+  cfg.scale_rewards_by_dt = True
   cfg.partial_reset_term_names = ("goal_scored", "ball_out_of_bounds")
   cfg.partial_reset_event_name = "reset_ball_only"
+  cfg.partial_reset_as_done = False
   cfg.preserve_observation_history_on_partial_reset = True
   cfg.preserve_action_history_on_partial_reset = True
   cfg.episode_length_s = 60.0
